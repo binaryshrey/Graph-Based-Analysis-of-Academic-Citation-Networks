@@ -17,11 +17,6 @@ metastore_db/
 derby.log
 spark-warehouse/
 
-# Project outputs
-keyword_search/
-paper_id_search/
-publication_search/
-
 # OS files
 .DS_Store
 Thumbs.db
