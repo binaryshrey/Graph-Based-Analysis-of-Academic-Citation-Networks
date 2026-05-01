@@ -1,0 +1,35 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Spark
+metastore_db/
+derby.log
+spark-warehouse/
+
+# Project outputs
+keyword_search/
+paper_id_search/
+publication_search/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment variables
+.env
