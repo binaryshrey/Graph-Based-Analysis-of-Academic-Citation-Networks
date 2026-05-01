@@ -194,24 +194,81 @@ def compute_pagerank(g, reset_prob=0.15, max_iter=10):
 
 # ─── 7. VISUALIZATION ──────────────────────────────────────────────────────────
 
+def _rank_color(rank, min_rank, max_rank):
+    """Map a PageRank value to a hex color (light blue -> dark blue)."""
+    if max_rank == min_rank:
+        t = 0.5
+    else:
+        t = (rank - min_rank) / (max_rank - min_rank)
+    r = int(220 - t * 180)
+    g = int(235 - t * 135)
+    b = int(255 - t * 55)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def generate_interactive_graph(g, output_file, project_root:Path, height="800px", width="100%"):
     """PyVis interactive viz of GraphFrame g (directed citation graph)."""
     pr = compute_pagerank(g).orderBy(col("rank").desc()).limit(50).collect()
+    rank_map = {r.id: r.rank for r in pr}
     top_ids = {r.id for r in pr[:10]}
+    ranks = list(rank_map.values())
+    min_r, max_r = (min(ranks), max(ranks)) if ranks else (0, 1)
+
     net = Network(height=height, width=width, directed=True, notebook=True, cdn_resources="in_line")
+    net.set_options("""{
+      "nodes": {
+        "font": {"size": 14, "face": "Arial", "color": "#333333"},
+        "borderWidth": 1.5,
+        "borderWidthSelected": 3,
+        "shadow": {"enabled": true, "size": 6, "x": 2, "y": 2}
+      },
+      "edges": {
+        "smooth": {"type": "continuous"},
+        "arrows": {"to": {"scaleFactor": 0.4}},
+        "color": {"color": "rgba(90, 130, 180, 0.4)"},
+        "selectionWidth": 2
+      },
+      "physics": {
+        "forceAtlas2Based": {
+          "gravitationalConstant": -80,
+          "centralGravity": 0.004,
+          "springLength": 200,
+          "springConstant": 0.04,
+          "damping": 0.5,
+          "avoidOverlap": 0.6
+        },
+        "solver": "forceAtlas2Based",
+        "stabilization": {"iterations": 200}
+      },
+      "interaction": {
+        "hover": true,
+        "tooltipDelay": 100,
+        "zoomView": true,
+        "dragView": true
+      }
+    }""")
 
     for v in g.vertices.collect():
+        rank = rank_map.get(v.id, min_r)
+        is_top = v.id in top_ids
+        size = 15 + 35 * ((rank - min_r) / (max_r - min_r) if max_r > min_r else 0.5)
+        label = (v.title[:40] + "...") if is_top and v.title and len(v.title) > 40 else (v.title if is_top else " ")
+        tooltip = f"{v.title or 'Untitled'}\nYear: {v.year}\nPageRank: {rank:.4f}"
         net.add_node(v.id,
-                     label=v.title if v.id in top_ids else " ",
-                     title=v.title or "",
-                     size=20 if v.id in top_ids else 10)
+                     label=label,
+                     title=tooltip,
+                     size=size,
+                     color=_rank_color(rank, min_r, max_r),
+                     shape="dot")
 
     for e in g.edges.collect():
-        thickness = max(e.weight*5, 1.0)
-        net.add_edge(e.src, e.dst, value=thickness, title=f"{e.weight:.3f}")
-
-    net.force_atlas_2based(gravity=-50, central_gravity=0.01, spring_length=150,
-                          spring_strength=0.08, damping=0.4)
+        w = e.weight or 0.0
+        edge_type = e.edge_type if hasattr(e, "edge_type") else "citation"
+        thickness = 0.3 + w * 3.0
+        net.add_edge(e.src, e.dst,
+                     value=thickness,
+                     title=f"Type: {edge_type}\nWeight: {w:.3f}",
+                     color="rgba(90, 130, 180, 0.4)")
 
     out_dir = project_root/"output"
     out_dir.mkdir(parents=True, exist_ok=True)
