@@ -497,11 +497,13 @@ def generate_interactive_graph(
     net.write_html(output_file)
     os.chdir(old_cwd)
 
-    # display inline (IFrame with file:// URIs doesn't work in JupyterLab)
+    # display via IFrame with a path relative to the notebook's working dir
     full_path = out_dir / output_file
-    with open(full_path, "r", encoding="utf-8") as f:
-        html_content = f.read()
-    display(HTML(html_content))
+    try:
+        rel_path = full_path.resolve().relative_to(Path.cwd().resolve())
+    except ValueError:
+        rel_path = full_path.resolve()
+    display(IFrame(src=str(rel_path), width=width, height=height))
     print(f"Saved interactive graph to {full_path}")
     return str(full_path)
 

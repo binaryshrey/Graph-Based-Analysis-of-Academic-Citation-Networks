@@ -278,9 +278,11 @@ def generate_interactive_graph(g, output_file, project_root:Path, height="800px"
     os.chdir(old)
 
     full = out_dir / output_file
-    with open(full, "r", encoding="utf-8") as f:
-        html_content = f.read()
-    display(HTML(html_content))
+    try:
+        rel_path = full.resolve().relative_to(Path.cwd().resolve())
+    except ValueError:
+        rel_path = full.resolve()
+    display(IFrame(src=str(rel_path), width="100%", height=height))
     return str(full)
 
 

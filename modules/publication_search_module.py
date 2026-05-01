@@ -306,9 +306,11 @@ def generate_interactive_graph(
     os.chdir(old)
 
     full_path = out_dir / output_file
-    with open(full_path, "r", encoding="utf-8") as f:
-        html_content = f.read()
-    display(HTML(html_content))
+    try:
+        rel_path = full_path.resolve().relative_to(Path.cwd().resolve())
+    except ValueError:
+        rel_path = full_path.resolve()
+    display(IFrame(src=str(rel_path), width="100%", height=height))
     return str(full_path)
 
 
@@ -337,8 +339,7 @@ def build_publication_graph_widget(spark, sc):
             )
             if g:
                 html = generate_interactive_graph(
-                    g, "pub_graph.html", PROJECT_ROOT,
-                    scale=5.0, min_thickness=1.0
+                    g, "pub_graph.html", PROJECT_ROOT
                 )
                 print(f"Graph saved to {html}")
 
