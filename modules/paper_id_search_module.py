@@ -17,7 +17,7 @@ import ipywidgets as widgets
 from pyvis.network import Network
 
 
-# ─── 1. SPARK INITIALIZATION (reuse from keyword module) ─────────────────────
+# ─── 1. SPARK INITIALIZATION ──────────────────────────────────────────────────
 
 def initialize_spark(
     app_name: str = "ResearchGraphByID",
@@ -39,120 +39,164 @@ def initialize_spark(
 # ─── 2. SCHEMA DEFINITION ─────────────────────────────────────────────────────
 
 def define_schema():
-    """Schema for Semantic-Scholar paper JSON (with embedding)."""
+    """Schema for OpenAlex work JSON (normalized)."""
     return StructType([
         StructField("paperId", StringType(), False),
         StructField("title",   StringType(), True),
         StructField("year",    IntegerType(), True),
-        StructField("references", ArrayType(
-            StructType([StructField("paperId", StringType(), False)])
-        ), True),
-        StructField("citations", ArrayType(
-            StructType([StructField("paperId", StringType(), False)])
-        ), True),
-        StructField("embedding", StructType([
-            StructField("model",  StringType(), True),
-            StructField("vector", ArrayType(DoubleType()), True)
-        ]), True)
+        StructField("referenced_works", ArrayType(StringType()), True),
+        StructField("cited_by_count", IntegerType(), True)
     ])
 
 
-# ─── 3. API FETCH ────────────────────────────────────────────────────────────
+# ─── 3. OPENALEX API CONFIG ──────────────────────────────────────────────────
 
-API_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
-FIELDS  = "title,year,referenceCount,citationCount,references,citations,embedding"
+API_BASE = "https://api.openalex.org"
+API_KEY = "MDWHtY4UnD5CKLVBenpBt4"
 
-def fetch_batch(id_lists):
-    """Fetch metadata for batches of paper-IDs (including embeddings)."""
+
+def _openalex_params(extra=None):
+    """Build base query params with API key."""
+    params = {"api_key": API_KEY}
+    if extra:
+        params.update(extra)
+    return params
+
+
+# ─── 4. API FETCH ────────────────────────────────────────────────────────────
+
+def fetch_works_by_ids(openalex_ids):
+    """
+    Fetch metadata for a list of OpenAlex work IDs.
+    Uses filter with OR (pipe) syntax for batch lookup.
+    Returns list of normalized paper dicts.
+    """
     session = requests.Session()
-    out = []
-    for batch in id_lists:
-        time.sleep(2)  # throttle
-        api_key = "s2k-ggzwNeWClIa8x62J17JKhjb28bApxfHdYxF7A63v"
-        headers = {"x-api-key": api_key}
-        r = session.post(API_URL, params={"fields":FIELDS}, headers = headers, json={"ids":batch})
+    results = []
+
+    # OpenAlex supports up to 50 IDs per OR filter
+    batch_size = 50
+    for i in range(0, len(openalex_ids), batch_size):
+        batch = openalex_ids[i:i + batch_size]
+        if i > 0:
+            time.sleep(1)  # throttle
+
+        # Build OR filter: id:W123|W456|...
+        id_filter = "|".join(
+            f"https://openalex.org/{oid}" if not oid.startswith("http") else oid
+            for oid in batch
+        )
+        params = _openalex_params({
+            "filter": f"openalex_id:{id_filter}",
+            "per_page": 50,
+            "select": "id,title,publication_year,referenced_works,cited_by_count"
+        })
+
+        r = session.get(f"{API_BASE}/works", params=params)
         r.raise_for_status()
-        out.extend(r.json())
-    return iter(out)
+        data = r.json().get("results", [])
+        print(f"Fetched batch {i // batch_size + 1}: {len(data)} works")
+
+        for w in data:
+            results.append(_normalize_work(w))
+
+    return results
 
 
-# ─── 4. COSINE‐SIMILARITY UDF ─────────────────────────────────────────────────
-
-def calculate_cosine_similarity(a, b):
-    """Safe cosine similarity for two Python lists."""
-    if a is None or b is None:
-        return 0.0
-    dot = sum(x*y for x,y in zip(a,b))
-    na  = math.sqrt(sum(x*x for x in a))
-    nb  = math.sqrt(sum(y*y for y in b))
-    return float(dot/(na*nb)) if na and nb else 0.0
+def _normalize_work(w):
+    """Normalize an OpenAlex work object to internal format."""
+    return {
+        "paperId": w["id"].replace("https://openalex.org/", ""),
+        "title": w.get("title") or w.get("display_name", ""),
+        "year": w.get("publication_year"),
+        "referenced_works": [
+            ref.replace("https://openalex.org/", "")
+            for ref in (w.get("referenced_works") or [])
+        ],
+        "cited_by_count": w.get("cited_by_count", 0)
+    }
 
 
 # ─── 5. GRAPH BUILDERS ───────────────────────────────────────────────────────
 
 def build_graph_from_ids(spark, sc, seed_ids, min_similarity=0.0):
     """
-    Given a list of paper‐IDs, fetch their metadata + 1-hop references,
-    build a directed, weighted citation graph.
+    Given a list of OpenAlex work IDs, fetch their metadata + 1-hop references,
+    build a directed citation graph.
     """
     schema = define_schema()
-    cos_udf = udf(calculate_cosine_similarity, DoubleType())
 
-    # 1) fetch seed metadata
-    rdd = sc.parallelize([seed_ids], numSlices=1).mapPartitions(fetch_batch)
-    df_seed = spark.read.schema(schema).json(rdd.map(json.dumps)).dropDuplicates(["paperId"])
+    # 1) normalize IDs (strip URL prefix if present)
+    seed_ids = [
+        sid.replace("https://openalex.org/", "") for sid in seed_ids
+    ]
 
-    # 2) extract 1-hop referenced IDs
-    cited = (df_seed
-        .select(explode("references.paperId").alias("paperId"))
-        .distinct()
-        .rdd.map(lambda r:r.paperId).collect()
+    # 2) fetch seed metadata
+    seed_papers = fetch_works_by_ids(seed_ids)
+    if not seed_papers:
+        print("No papers found for the given IDs.")
+        return None
+
+    print(f"Seed papers fetched: {len(seed_papers)}")
+
+    # 3) extract 1-hop referenced IDs
+    cited_ids = set()
+    for p in seed_papers:
+        for ref in (p.get("referenced_works") or []):
+            if ref not in seed_ids:
+                cited_ids.add(ref)
+
+    # 4) fetch cited metadata (limit to first 200 for performance)
+    cited_ids = list(cited_ids)[:200]
+    cited_papers = []
+    if cited_ids:
+        cited_papers = fetch_works_by_ids(cited_ids)
+        print(f"Referenced papers fetched: {len(cited_papers)}")
+
+    # 5) union into full paper set
+    all_papers = seed_papers + cited_papers
+    seen = set()
+    unique_papers = []
+    for p in all_papers:
+        if p["paperId"] not in seen:
+            seen.add(p["paperId"])
+            unique_papers.append(p)
+
+    # 6) build vertices DF
+    rdd = sc.parallelize(unique_papers)
+    vertices = (
+        spark.read.schema(schema)
+             .json(rdd.map(json.dumps))
+             .dropDuplicates(["paperId"])
+             .withColumnRenamed("paperId", "id")
+             .select("id", "title", "year", "referenced_works")
     )
 
-    # 3) fetch cited metadata
-    if cited:
-        rdd2 = sc.parallelize([cited],1).mapPartitions(fetch_batch)
-        df_cited = spark.read.schema(schema).json(rdd2.map(json.dumps)).dropDuplicates(["paperId"])
-    else:
-        df_cited = spark.createDataFrame([], schema)
+    v_count = vertices.count()
+    print(f"Vertices built: {v_count}")
 
-    # 4) union into full vertex set
-    df = df_seed.unionByName(df_cited).dropDuplicates(["paperId"]).filter(col("paperId").isNotNull())
-
-    # 5) build vertices DF
-    vertices = (df
-        .select("paperId","title","year","embedding.vector")
-        .withColumnRenamed("paperId","id")
-        .dropDuplicates(["id"])
+    # 7) build directed citation edges A→B
+    refs = (
+        vertices
+        .select(col("id").alias("src"), explode("referenced_works").alias("dst"))
+        .dropDuplicates(["src", "dst"])
+    )
+    # restrict to IDs in our vertex set
+    valid_ids = vertices.select(col("id").alias("dst"))
+    edges = (
+        refs.join(valid_ids, on="dst", how="inner")
+            .withColumn("weight", lit(1.0))
+            .select("src", "dst", "weight")
     )
 
-    # 6) build directed citation edges A→B
-    refs = (df
-        .select(col("paperId").alias("src"), explode("references.paperId").alias("dst"))
-        .dropDuplicates(["src","dst"])
-    )
-    # restrict to 1-hop
-    refs = refs.join(vertices.select(col("id").alias("dst")), on="dst", how="inner")
+    e_count = edges.count()
+    print(f"Citation edges: {e_count}")
 
-    # attach embeddings & compute weight
-    emb_s = vertices.select(col("id").alias("src"), col("vector").alias("emb_src"))
-    emb_d = vertices.select(col("id").alias("dst"), col("vector").alias("emb_dst"))
-    edges = (refs
-        .join(emb_s, "src", "left")
-        .join(emb_d, "dst", "left")
-        .withColumn("weight", cos_udf("emb_src","emb_dst"))
-        .select("src","dst","weight")
-    )
+    if e_count == 0:
+        print("No citation edges found; building fallback connectivity edges.")
+        edges = build_fallback_edges(vertices)
 
-    if edges.limit(1).count() == 0:
-        fallback_threshold = max(min_similarity, 0.2)
-        print(
-            "No citation edges found for the seed IDs; using similarity edges "
-            f"(min_similarity={fallback_threshold})."
-        )
-        edges = build_similarity_edges(vertices, cos_udf, fallback_threshold)
-
-    # 7) assemble GraphFrame
+    # 8) assemble GraphFrame
     from graphframes import GraphFrame
     if SparkSession.getActiveSession() is None:
         import graphframes.graphframe as _gf_mod
@@ -167,32 +211,124 @@ def build_graph_from_ids(spark, sc, seed_ids, min_similarity=0.0):
             self.SRC = self._jvm_gf_api.SRC()
             self.DST = self._jvm_gf_api.DST()
         GraphFrame.__init__ = _patched_init
-    g = GraphFrame(vertices, edges)
-    g.vertices.cache(); g.edges.cache()
+
+    g = GraphFrame(vertices.select("id", "title", "year"), edges)
+    g.vertices.cache()
+    g.edges.cache()
+    print(f"✅ Graph: {g.vertices.count()} vertices, {g.edges.count()} edges")
     return g
 
 
-# ─── 6. PAGERANK ───────────────────────────────────────────────────────────────
+def build_fallback_edges(vertices):
+    """Build star-topology edges from first vertex to all others as fallback."""
+    ids = [r.id for r in vertices.select("id").collect()]
+    if len(ids) <= 1:
+        schema = StructType([
+            StructField("src", StringType(), False),
+            StructField("dst", StringType(), False),
+            StructField("weight", DoubleType(), False)
+        ])
+        return vertices.sparkSession.createDataFrame([], schema)
+    data = []
+    for other in ids[1:]:
+        data += [(ids[0], other, 1.0), (other, ids[0], 1.0)]
+    schema = StructType([
+        StructField("src", StringType(), False),
+        StructField("dst", StringType(), False),
+        StructField("weight", DoubleType(), False)
+    ])
+    return vertices.sparkSession.createDataFrame(data, schema)
+
+
+# ─── 6. LOUVAIN COMMUNITY DETECTION ──────────────────────────────────────────
+
+def compute_louvain_communities(g, resolution=1.0):
+    """
+    Run Louvain community detection on the citation network.
+    Uses networkx + community (python-louvain) for modularity-based detection.
+    Falls back to GraphFrames labelPropagation if networkx is unavailable.
+
+    Returns a Spark DataFrame with columns: id, community, title, year
+    """
+    try:
+        import networkx as nx
+        from community import community_louvain
+
+        edges_collected = g.edges.select("src", "dst", "weight").collect()
+        vertices_collected = g.vertices.select("id").collect()
+
+        G = nx.Graph()
+        for v in vertices_collected:
+            G.add_node(v.id)
+        for e in edges_collected:
+            if G.has_edge(e.src, e.dst):
+                G[e.src][e.dst]["weight"] += e.weight
+            else:
+                G.add_edge(e.src, e.dst, weight=e.weight)
+
+        partition = community_louvain.best_partition(
+            G, weight="weight", resolution=resolution, random_state=42
+        )
+
+        n_communities = len(set(partition.values()))
+        modularity = community_louvain.modularity(partition, G, weight="weight")
+        print(f"Louvain detected {n_communities} communities (modularity={modularity:.4f})")
+
+        community_data = [(node, int(comm)) for node, comm in partition.items()]
+        schema = StructType([
+            StructField("id", StringType(), False),
+            StructField("community", IntegerType(), False)
+        ])
+        spark = g.vertices.sparkSession
+        community_df = spark.createDataFrame(community_data, schema)
+        result = community_df.join(g.vertices.select("id", "title"), on="id")
+        return result
+
+    except ImportError:
+        print("networkx/python-louvain not available, falling back to LabelPropagation.")
+        lp = g.labelPropagation(maxIter=5)
+        result = lp.withColumnRenamed("label", "community")
+        n_communities = result.select("community").distinct().count()
+        print(f"LabelPropagation detected {n_communities} communities")
+        return result
+
+
+def get_community_summary(community_df):
+    """Summarize communities: size and representative papers per community."""
+    from pyspark.sql.functions import count, collect_list, struct
+    summary = (
+        community_df
+        .groupBy("community")
+        .agg(
+            count("id").alias("size"),
+            collect_list(struct("id", "title")).alias("papers")
+        )
+        .orderBy(col("size").desc())
+    )
+    return summary
+
+
+# ─── 7. PAGERANK ───────────────────────────────────────────────────────────────
 
 def compute_pagerank(g, reset_prob=0.15, max_iter=10):
     """DataFrame‐based weighted PageRank on GraphFrame."""
     ranks = g.vertices.select("id").withColumn("rank", lit(1.0))
     for _ in range(max_iter):
         contribs = (g.edges
-            .join(ranks.withColumnRenamed("id","src"), on="src")
-            .withColumn("contrib", col("rank")*col("weight"))
+            .join(ranks.withColumnRenamed("id", "src"), on="src")
+            .withColumn("contrib", col("rank") * col("weight"))
             .select(col("dst").alias("id"), "contrib")
         )
-        summed = contribs.groupBy("id").sum("contrib").withColumnRenamed("sum(contrib)","sumContrib")
+        summed = contribs.groupBy("id").sum("contrib").withColumnRenamed("sum(contrib)", "sumContrib")
         ranks = (g.vertices.select("id")
             .join(summed, on="id", how="left")
-            .withColumn("rank", lit(reset_prob) + (1-reset_prob)*coalesce(col("sumContrib"),lit(0.0)))
-            .select("id","rank")
+            .withColumn("rank", lit(reset_prob) + (1 - reset_prob) * coalesce(col("sumContrib"), lit(0.0)))
+            .select("id", "rank")
         )
-    return ranks.join(g.vertices.select("id","title"), on="id")
+    return ranks.join(g.vertices.select("id", "title"), on="id")
 
 
-# ─── 7. VISUALIZATION ──────────────────────────────────────────────────────────
+# ─── 8. VISUALIZATION ──────────────────────────────────────────────────────────
 
 def _rank_color(rank, min_rank, max_rank):
     """Map a PageRank value to a hex color (light blue -> dark blue)."""
@@ -206,13 +342,31 @@ def _rank_color(rank, min_rank, max_rank):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def generate_interactive_graph(g, output_file, project_root:Path, height="800px", width="100%"):
-    """PyVis interactive viz of GraphFrame g (directed citation graph)."""
+_COMMUNITY_COLORS = [
+    "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
+    "#911eb4", "#42d4f4", "#f032e6", "#bfef45", "#fabed4",
+    "#469990", "#dcbeff", "#9a6324", "#fffac8", "#800000",
+    "#aaffc3", "#808000", "#ffd8b1", "#000075", "#a9a9a9",
+]
+
+
+def generate_interactive_graph(g, output_file, project_root: Path, height="800px", width="100%", color_by_community=True):
+    """PyVis interactive viz of GraphFrame g, colored by Louvain community."""
     pr = compute_pagerank(g).orderBy(col("rank").desc()).limit(50).collect()
     rank_map = {r.id: r.rank for r in pr}
     top_ids = {r.id for r in pr[:10]}
     ranks = list(rank_map.values())
     min_r, max_r = (min(ranks), max(ranks)) if ranks else (0, 1)
+
+    # Compute community assignments for coloring
+    community_map = {}
+    if color_by_community:
+        try:
+            comm_df = compute_louvain_communities(g)
+            for row in comm_df.select("id", "community").collect():
+                community_map[row.id] = row.community
+        except Exception:
+            pass
 
     net = Network(height=height, width=width, directed=True, notebook=True, cdn_resources="in_line")
     net.set_options("""{
@@ -253,24 +407,25 @@ def generate_interactive_graph(g, output_file, project_root:Path, height="800px"
         is_top = v.id in top_ids
         size = 15 + 35 * ((rank - min_r) / (max_r - min_r) if max_r > min_r else 0.5)
         label = (v.title[:40] + "...") if is_top and v.title and len(v.title) > 40 else (v.title if is_top else " ")
-        tooltip = f"{v.title or 'Untitled'}\nYear: {v.year}\nPageRank: {rank:.4f}"
+        comm = community_map.get(v.id, 0)
+        color = _COMMUNITY_COLORS[comm % len(_COMMUNITY_COLORS)] if community_map else _rank_color(rank, min_r, max_r)
+        tooltip = f"{v.title or 'Untitled'}\nYear: {v.year}\nCommunity: {comm}\nPageRank: {rank:.4f}"
         net.add_node(v.id,
                      label=label,
                      title=tooltip,
                      size=size,
-                     color=_rank_color(rank, min_r, max_r),
+                     color=color,
                      shape="dot")
 
     for e in g.edges.collect():
         w = e.weight or 0.0
-        edge_type = e.edge_type if hasattr(e, "edge_type") else "citation"
         thickness = 0.3 + w * 3.0
         net.add_edge(e.src, e.dst,
                      value=thickness,
-                     title=f"Type: {edge_type}\nWeight: {w:.3f}",
+                     title=f"Weight: {w:.3f}",
                      color="rgba(90, 130, 180, 0.4)")
 
-    out_dir = project_root/"output"
+    out_dir = project_root / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
     old = os.getcwd()
     os.chdir(out_dir)
@@ -286,47 +441,24 @@ def generate_interactive_graph(g, output_file, project_root:Path, height="800px"
     return str(full)
 
 
-def build_similarity_edges(vertices, cos_udf, min_similarity=0.2):
-    """Build similarity edges between all vertex pairs using embeddings."""
-    v1 = vertices.select(col("id").alias("src"), col("vector").alias("emb_src"))
-    v2 = vertices.select(col("id").alias("dst"), col("vector").alias("emb_dst"))
+# ─── 9. PARQUET SAVE ──────────────────────────────────────────────────────────
 
-    raw = v1.crossJoin(v2).filter(col("src") < col("dst"))
-    edges = (
-        raw
-        .withColumn("weight", cos_udf("emb_src", "emb_dst"))
-        .filter(col("weight") >= lit(min_similarity))
-        .select("src", "dst", "weight")
-    )
-
-    edges_dir = edges.union(
-        edges.select(
-            col("dst").alias("src"),
-            col("src").alias("dst"),
-            col("weight"),
-        )
-    )
-    return edges_dir
-
-
-# ─── 8. PARQUET SAVE ──────────────────────────────────────────────────────────
-
-def save_graph_parquet(g, name, project_root:Path, shuffle_partitions:int=32):
+def save_graph_parquet(g, name, project_root: Path, shuffle_partitions: int = 32):
     """Persist vertices & edges as Parquet under project_root/processed/…"""
-    v_out = project_root/"processed"/"vertices"
-    e_out = project_root/"processed"/"edges_weighted"
-    g.vertices.select("id","title","year").write.mode("overwrite").partitionBy("year").parquet(str(v_out))
+    v_out = project_root / "processed" / "vertices"
+    e_out = project_root / "processed" / "edges_weighted"
+    g.vertices.select("id", "title", "year").write.mode("overwrite").partitionBy("year").parquet(str(v_out))
     g.edges.repartition(shuffle_partitions).write.mode("overwrite").parquet(str(e_out))
     return str(v_out), str(e_out)
 
 
-# ─── 9. WIDGETS ───────────────────────────────────────────────────────────────
+# ─── 10. WIDGETS ──────────────────────────────────────────────────────────────
 
 def build_id_graph_widget(spark, sc):
-    """Single UI to input seed IDs, build & visualize the citation graph."""
+    """Single UI to input OpenAlex work IDs, build & visualize the citation graph."""
     txt = widgets.Text(
         description="IDs:",
-        placeholder="e.g. 649def34f8be52c8b66281af98ae884c09aef38b, ARXIV:2106.15928"
+        placeholder="e.g. W2741809807, W2100837269"
     )
     btn = widgets.Button(description="Build Graph", button_style="primary")
     out = widgets.Output()
@@ -337,21 +469,18 @@ def build_id_graph_widget(spark, sc):
             # parse IDs
             seed_ids = [i.strip() for i in txt.value.split(",") if i.strip()]
             if not seed_ids:
-                print("Please enter at least one paper ID.")
+                print("Please enter at least one OpenAlex work ID.")
                 return
 
             print("Building graph for IDs:", seed_ids)
-            # build the GraphFrame (uses default min_similarity)
             g = build_graph_from_ids(spark, sc, seed_ids)
 
             if g is None:
                 print("Graph construction failed.")
                 return
 
-            # # show PageRank top‐10
+            # show PageRank top-10
             pr = compute_pagerank(g).orderBy(col("rank").desc()).limit(10)
-            # print("\nTop 10 papers by PageRank:")
-            # pr.show(truncate=False)
 
             # save to parquet
             v_path, e_path = save_graph_parquet(g, "id_graph", PROJECT_ROOT)
