@@ -91,6 +91,27 @@ def _normalize_authors(authorships):
     return authors
 
 
+def _sanitize_references(refs):
+    clean_refs = []
+    seen = set()
+    for ref in (refs or []):
+        ref_id = (ref or "").replace("https://openalex.org/", "").strip()
+        if ref_id and ref_id not in seen:
+            seen.add(ref_id)
+            clean_refs.append(ref_id)
+    return clean_refs
+
+
+def _dedupe_papers(papers):
+    deduped = {}
+    for paper in papers:
+        paper_id = (paper.get("paperId") or "").strip()
+        if not paper_id:
+            continue
+        deduped[paper_id] = paper
+    return list(deduped.values())
+
+
 def _save_raw_payload(payload, query_name, project_root: Path = PROJECT_ROOT):
     raw_dir = Path(project_root) / "publication_search" / "raw_json"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -154,16 +175,13 @@ def publication_search(
             if w.get("primary_location") and w["primary_location"].get("source"):
                 source_name = w["primary_location"]["source"].get("display_name", "")
             normalized = {
-                "paperId": w["id"].replace("https://openalex.org/", ""),
-                "title": w.get("title") or w.get("display_name", ""),
-                "venue": source_name,
-                "year": w.get("publication_year"),
+                "paperId": (w.get("id") or "").replace("https://openalex.org/", "").strip(),
+                "title": (w.get("title") or w.get("display_name") or "Untitled").strip(),
+                "venue": (source_name or "Unknown Venue").strip(),
+                "year": w.get("publication_year") or -1,
                 "authors": _normalize_authors(w.get("authorships")),
-                "cited_by_count": w.get("cited_by_count", 0),
-                "referenced_works": [
-                    ref.replace("https://openalex.org/", "")
-                    for ref in (w.get("referenced_works") or [])
-                ]
+                "cited_by_count": w.get("cited_by_count") or 0,
+                "referenced_works": _sanitize_references(w.get("referenced_works"))
             }
             if normalized["paperId"] not in seen_ids:
                 seen_ids.add(normalized["paperId"])
@@ -189,7 +207,7 @@ def publication_search(
             "pages": raw_payloads,
         }, query_name=f"publication_{publication}_{year}", project_root=project_root)
 
-    return papers
+    return _dedupe_papers(papers)
 
 
 # ─── 5. GRAPH BUILDER ────────────────────────────────────────────────────────
@@ -222,6 +240,7 @@ def build_graph_from_publication(
         spark.read.schema(schema)
              .json(rdd.map(json.dumps))
              .dropDuplicates(["paperId"])
+             .filter(col("paperId").isNotNull() & (col("paperId") != ""))
              .withColumnRenamed("paperId", "id")
              .select("id", "title", "venue", "year", "authors", "cited_by_count", "referenced_works")
     )
@@ -236,6 +255,7 @@ def build_graph_from_publication(
     refs = (
         vertices
         .select(col("id").alias("src"), explode("referenced_works").alias("dst"))
+        .filter(col("dst").isNotNull() & (col("dst") != ""))
         .dropDuplicates(["src", "dst"])
     )
     # keep only edges where dst is in our vertex set
