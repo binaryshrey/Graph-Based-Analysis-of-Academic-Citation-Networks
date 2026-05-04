@@ -39,7 +39,7 @@ def initialize_spark(
         .config("spark.driver.memory", driver_memory) \
         .config("spark.sql.shuffle.partitions", str(shuffle_partitions)) \
         .config("spark.jars.ivy", str(ivy_dir)) \
-        .config("spark.jars.packages", "graphframes:graphframes:0.8.4-spark3.5-s_2.13") \
+        .config("spark.jars.packages", "graphframes:graphframes:0.8.4-spark3.5-s_2.12") \
         .getOrCreate()
     sc = spark.sparkContext
     sc.setLogLevel("ERROR")
