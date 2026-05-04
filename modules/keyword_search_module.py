@@ -92,17 +92,35 @@ def _normalize_authors(authorships):
     return authors
 
 
+def _sanitize_references(refs):
+    clean_refs = []
+    seen = set()
+    for ref in (refs or []):
+        ref_id = (ref or "").replace("https://openalex.org/", "").strip()
+        if ref_id and ref_id not in seen:
+            seen.add(ref_id)
+            clean_refs.append(ref_id)
+    return clean_refs
+
+
+def _dedupe_papers(papers):
+    deduped = {}
+    for paper in papers:
+        paper_id = (paper.get("paperId") or "").strip()
+        if not paper_id:
+            continue
+        deduped[paper_id] = paper
+    return list(deduped.values())
+
+
 def _normalize_work(w):
     return {
-        "paperId": w["id"].replace("https://openalex.org/", ""),
-        "title": w.get("title") or w.get("display_name", ""),
-        "year": w.get("publication_year"),
+        "paperId": (w.get("id") or "").replace("https://openalex.org/", "").strip(),
+        "title": (w.get("title") or w.get("display_name") or "Untitled").strip(),
+        "year": w.get("publication_year") or -1,
         "authors": _normalize_authors(w.get("authorships")),
-        "referenced_works": [
-            ref.replace("https://openalex.org/", "")
-            for ref in (w.get("referenced_works") or [])
-        ],
-        "cited_by_count": w.get("cited_by_count", 0)
+        "referenced_works": _sanitize_references(w.get("referenced_works")),
+        "cited_by_count": w.get("cited_by_count") or 0
     }
 
 
@@ -191,6 +209,7 @@ def keyword_search(
                 "pages": raw_payloads,
             }, query_name=f"keyword_{query}", project_root=project_root)
 
+        papers = _dedupe_papers(papers)
         print(f"Found {len(papers)} papers for query \"{query}\"")
         return papers
     except Exception as e:
@@ -241,7 +260,7 @@ def fetch_works_by_ids(openalex_ids, save_raw_json=False, raw_tag="keyword_ids",
             "batches": raw_payloads,
         }, query_name=raw_tag, project_root=project_root)
 
-    return results
+    return _dedupe_papers(results)
 
 
 # ─── 5. GRAPH BUILDERS ────────────────────────────────────────────────────────
@@ -263,7 +282,11 @@ def build_graph_from_keywords(
 
     # 2) to DF
     json_rdd = sc.parallelize(papers)
-    df_seed = spark.read.schema(schema).json(json_rdd.map(json.dumps)).dropDuplicates(["paperId"])
+    df_seed = (
+        spark.read.schema(schema).json(json_rdd.map(json.dumps))
+        .dropDuplicates(["paperId"])
+        .filter(col("paperId").isNotNull() & (col("paperId") != ""))
+    )
 
     # 3) optionally add central paper
     ids = df_seed.select("paperId").rdd.map(lambda r: r.paperId).collect()
@@ -280,7 +303,10 @@ def build_graph_from_keywords(
             if cent_papers:
                 print("Central Paper found")
                 cent_rdd = sc.parallelize(cent_papers)
-                cent_df = spark.read.schema(schema).json(cent_rdd.map(json.dumps))
+                cent_df = (
+                    spark.read.schema(schema).json(cent_rdd.map(json.dumps))
+                    .filter(col("paperId").isNotNull() & (col("paperId") != ""))
+                )
                 if cent_df.count() > 0:
                     df_seed = df_seed.unionByName(cent_df).dropDuplicates(["paperId"])
                     ids.append(central_paper)
@@ -336,6 +362,7 @@ def build_star_edges(vertices, df_seed, central_paper):
     all_cits = (
         df_seed
         .select(col("paperId").alias("src"), explode("referenced_works").alias("dst"))
+        .filter(col("dst").isNotNull() & (col("dst") != ""))
         .dropDuplicates(["src", "dst"])
     )
 
@@ -401,6 +428,7 @@ def build_citation_edges(vertices, df_seed):
     refs = (
         df_seed
         .select(col("paperId").alias("src"), explode("referenced_works").alias("dst"))
+        .filter(col("dst").isNotNull() & (col("dst") != ""))
         .dropDuplicates(["src", "dst"])
     )
     # keep only those dst in our vertices
