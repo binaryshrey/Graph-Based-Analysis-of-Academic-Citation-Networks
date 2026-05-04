@@ -11,11 +11,13 @@ build/
 
 # Jupyter
 .ipynb_checkpoints/
+.jupyter/
 
 # Spark
 metastore_db/
 derby.log
 spark-warehouse/
+.spark_ivy/
 
 # OS files
 .DS_Store

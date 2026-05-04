@@ -1,10 +1,11 @@
 # paper_id_search_module.py
 
 import os, time, json, math, gzip, pickle, requests
+from datetime import datetime
 from pathlib import Path
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, explode, udf, lit, coalesce
+from pyspark.sql.functions import col, explode, udf, lit, coalesce, countDistinct, sum as spark_sum
 from pyspark.sql.types import (
     StructType, StructField,
     StringType, IntegerType,
@@ -25,10 +26,13 @@ def initialize_spark(
     shuffle_partitions: int = 32
 ):
     """Initialize SparkSession with GraphFrames support."""
+    ivy_dir = Path(__file__).resolve().parent.parent / ".spark_ivy"
+    ivy_dir.mkdir(parents=True, exist_ok=True)
     spark = SparkSession.builder \
         .appName(app_name) \
         .config("spark.driver.memory", driver_memory) \
         .config("spark.sql.shuffle.partitions", str(shuffle_partitions)) \
+        .config("spark.jars.ivy", str(ivy_dir)) \
         .config("spark.jars.packages", "graphframes:graphframes:0.8.4-spark3.5-s_2.13") \
         .getOrCreate()
     sc = spark.sparkContext
@@ -44,6 +48,12 @@ def define_schema():
         StructField("paperId", StringType(), False),
         StructField("title",   StringType(), True),
         StructField("year",    IntegerType(), True),
+        StructField("authors", ArrayType(
+            StructType([
+                StructField("authorId", StringType(), True),
+                StructField("name", StringType(), True)
+            ])
+        ), True),
         StructField("referenced_works", ArrayType(StringType()), True),
         StructField("cited_by_count", IntegerType(), True)
     ])
@@ -53,6 +63,7 @@ def define_schema():
 
 API_BASE = "https://api.openalex.org"
 API_KEY = "MDWHtY4UnD5CKLVBenpBt4"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _openalex_params(extra=None):
@@ -63,9 +74,32 @@ def _openalex_params(extra=None):
     return params
 
 
+def _normalize_authors(authorships):
+    authors = []
+    for auth in (authorships or []):
+        author = auth.get("author", {})
+        authors.append({
+            "authorId": (author.get("id") or "").replace("https://openalex.org/", ""),
+            "name": author.get("display_name", "")
+        })
+    return authors
+
+
+def _save_raw_payload(payload, query_name, project_root: Path = PROJECT_ROOT):
+    raw_dir = Path(project_root) / "paper_id_search" / "raw_json"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in query_name)[:80]
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    raw_path = raw_dir / f"{safe_name}_{timestamp}.json.gz"
+    with gzip.open(raw_path, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"Saved raw OpenAlex response to {raw_path}")
+    return raw_path
+
+
 # ─── 4. API FETCH ────────────────────────────────────────────────────────────
 
-def fetch_works_by_ids(openalex_ids):
+def fetch_works_by_ids(openalex_ids, save_raw_json=False, raw_tag="paper_ids", project_root: Path = PROJECT_ROOT):
     """
     Fetch metadata for a list of OpenAlex work IDs.
     Uses filter with OR (pipe) syntax for batch lookup.
@@ -73,6 +107,7 @@ def fetch_works_by_ids(openalex_ids):
     """
     session = requests.Session()
     results = []
+    raw_payloads = []
 
     # OpenAlex supports up to 50 IDs per OR filter
     batch_size = 50
@@ -89,16 +124,25 @@ def fetch_works_by_ids(openalex_ids):
         params = _openalex_params({
             "filter": f"openalex_id:{id_filter}",
             "per_page": 50,
-            "select": "id,title,publication_year,referenced_works,cited_by_count"
+            "select": "id,title,publication_year,authorships,referenced_works,cited_by_count"
         })
 
         r = session.get(f"{API_BASE}/works", params=params)
         r.raise_for_status()
-        data = r.json().get("results", [])
+        payload = r.json()
+        data = payload.get("results", [])
+        if save_raw_json:
+            raw_payloads.append(payload)
         print(f"Fetched batch {i // batch_size + 1}: {len(data)} works")
 
         for w in data:
             results.append(_normalize_work(w))
+
+    if save_raw_json and raw_payloads:
+        _save_raw_payload({
+            "openalex_ids": openalex_ids,
+            "batches": raw_payloads,
+        }, query_name=raw_tag, project_root=project_root)
 
     return results
 
@@ -109,6 +153,7 @@ def _normalize_work(w):
         "paperId": w["id"].replace("https://openalex.org/", ""),
         "title": w.get("title") or w.get("display_name", ""),
         "year": w.get("publication_year"),
+        "authors": _normalize_authors(w.get("authorships")),
         "referenced_works": [
             ref.replace("https://openalex.org/", "")
             for ref in (w.get("referenced_works") or [])
@@ -119,7 +164,15 @@ def _normalize_work(w):
 
 # ─── 5. GRAPH BUILDERS ───────────────────────────────────────────────────────
 
-def build_graph_from_ids(spark, sc, seed_ids, min_similarity=0.0):
+def build_graph_from_ids(
+    spark,
+    sc,
+    seed_ids,
+    min_similarity=0.0,
+    max_hops=1,
+    per_hop_limit=200,
+    save_raw_json=False,
+):
     """
     Given a list of OpenAlex work IDs, fetch their metadata + 1-hop references,
     build a directed citation graph.
@@ -132,35 +185,52 @@ def build_graph_from_ids(spark, sc, seed_ids, min_similarity=0.0):
     ]
 
     # 2) fetch seed metadata
-    seed_papers = fetch_works_by_ids(seed_ids)
+    seed_papers = fetch_works_by_ids(
+        seed_ids,
+        save_raw_json=save_raw_json,
+        raw_tag="paper_id_seed_batch",
+        project_root=PROJECT_ROOT,
+    )
     if not seed_papers:
         print("No papers found for the given IDs.")
         return None
 
     print(f"Seed papers fetched: {len(seed_papers)}")
 
-    # 3) extract 1-hop referenced IDs
-    cited_ids = set()
-    for p in seed_papers:
-        for ref in (p.get("referenced_works") or []):
-            if ref not in seed_ids:
-                cited_ids.add(ref)
+    papers_by_id = {paper["paperId"]: paper for paper in seed_papers}
+    frontier_papers = seed_papers
+    known_ids = set(papers_by_id.keys())
 
-    # 4) fetch cited metadata (limit to first 200 for performance)
-    cited_ids = list(cited_ids)[:200]
-    cited_papers = []
-    if cited_ids:
-        cited_papers = fetch_works_by_ids(cited_ids)
-        print(f"Referenced papers fetched: {len(cited_papers)}")
+    for hop in range(1, max_hops + 1):
+        candidate_ids = []
+        candidate_set = set()
+        for paper in frontier_papers:
+            for ref in (paper.get("referenced_works") or []):
+                if ref not in known_ids and ref not in candidate_set:
+                    candidate_ids.append(ref)
+                    candidate_set.add(ref)
+
+        if not candidate_ids:
+            print(f"No new references found at hop {hop}.")
+            break
+
+        if per_hop_limit and len(candidate_ids) > per_hop_limit:
+            print(f"Hop {hop}: trimming referenced-paper fetch from {len(candidate_ids)} to {per_hop_limit}")
+            candidate_ids = candidate_ids[:per_hop_limit]
+
+        frontier_papers = fetch_works_by_ids(
+            candidate_ids,
+            save_raw_json=save_raw_json,
+            raw_tag=f"paper_id_hop_{hop}",
+            project_root=PROJECT_ROOT,
+        )
+        print(f"Hop {hop}: fetched {len(frontier_papers)} referenced papers")
+        for paper in frontier_papers:
+            papers_by_id.setdefault(paper["paperId"], paper)
+        known_ids.update(papers_by_id.keys())
 
     # 5) union into full paper set
-    all_papers = seed_papers + cited_papers
-    seen = set()
-    unique_papers = []
-    for p in all_papers:
-        if p["paperId"] not in seen:
-            seen.add(p["paperId"])
-            unique_papers.append(p)
+    unique_papers = list(papers_by_id.values())
 
     # 6) build vertices DF
     rdd = sc.parallelize(unique_papers)
@@ -169,7 +239,7 @@ def build_graph_from_ids(spark, sc, seed_ids, min_similarity=0.0):
              .json(rdd.map(json.dumps))
              .dropDuplicates(["paperId"])
              .withColumnRenamed("paperId", "id")
-             .select("id", "title", "year", "referenced_works")
+             .select("id", "title", "year", "authors", "referenced_works", "cited_by_count")
     )
 
     v_count = vertices.count()
@@ -212,7 +282,7 @@ def build_graph_from_ids(spark, sc, seed_ids, min_similarity=0.0):
             self.DST = self._jvm_gf_api.DST()
         GraphFrame.__init__ = _patched_init
 
-    g = GraphFrame(vertices.select("id", "title", "year"), edges)
+    g = GraphFrame(vertices.select("id", "title", "year", "authors", "cited_by_count"), edges)
     g.vertices.cache()
     g.edges.cache()
     print(f"✅ Graph: {g.vertices.count()} vertices, {g.edges.count()} edges")
@@ -326,6 +396,36 @@ def compute_pagerank(g, reset_prob=0.15, max_iter=10):
             .select("id", "rank")
         )
     return ranks.join(g.vertices.select("id", "title"), on="id")
+
+
+def compute_author_influence(g, top_n=None):
+    """Aggregate paper-level PageRank into author-level influence scores."""
+    if "authors" not in g.vertices.columns:
+        print("Author information is not available in this graph.")
+        return None
+
+    pagerank_df = compute_pagerank(g).select("id", "rank")
+    author_scores = (
+        g.vertices
+        .select("id", explode("authors").alias("author"))
+        .join(pagerank_df, on="id", how="inner")
+        .select(
+            "id",
+            col("author.authorId").alias("authorId"),
+            col("author.name").alias("authorName"),
+            "rank",
+        )
+        .filter(col("authorId") != "")
+        .groupBy("authorId", "authorName")
+        .agg(
+            spark_sum("rank").alias("influenceScore"),
+            countDistinct("id").alias("paperCount"),
+        )
+        .orderBy(col("influenceScore").desc(), col("paperCount").desc())
+    )
+    if top_n:
+        return author_scores.limit(top_n)
+    return author_scores
 
 
 # ─── 8. VISUALIZATION ──────────────────────────────────────────────────────────
@@ -445,9 +545,9 @@ def generate_interactive_graph(g, output_file, project_root: Path, height="800px
 
 def save_graph_parquet(g, name, project_root: Path, shuffle_partitions: int = 32):
     """Persist vertices & edges as Parquet under project_root/processed/…"""
-    v_out = project_root / "processed" / "vertices"
-    e_out = project_root / "processed" / "edges_weighted"
-    g.vertices.select("id", "title", "year").write.mode("overwrite").partitionBy("year").parquet(str(v_out))
+    v_out = project_root / "processed" / f"{name}_vertices"
+    e_out = project_root / "processed" / f"{name}_edges_weighted"
+    g.vertices.write.mode("overwrite").partitionBy("year").parquet(str(v_out))
     g.edges.repartition(shuffle_partitions).write.mode("overwrite").parquet(str(e_out))
     return str(v_out), str(e_out)
 
@@ -460,6 +560,9 @@ def build_id_graph_widget(spark, sc):
         description="IDs:",
         placeholder="e.g. W2741809807, W2100837269"
     )
+    hops = widgets.IntSlider(description="Max Hops:", min=1, max=4, step=1, value=2)
+    per_hop = widgets.IntSlider(description="Hop Fetch Cap:", min=50, max=1000, step=50, value=300)
+    raw = widgets.Checkbox(description="Save raw JSON", value=True)
     btn = widgets.Button(description="Build Graph", button_style="primary")
     out = widgets.Output()
 
@@ -473,7 +576,14 @@ def build_id_graph_widget(spark, sc):
                 return
 
             print("Building graph for IDs:", seed_ids)
-            g = build_graph_from_ids(spark, sc, seed_ids)
+            g = build_graph_from_ids(
+                spark,
+                sc,
+                seed_ids,
+                max_hops=hops.value,
+                per_hop_limit=per_hop.value,
+                save_raw_json=raw.value,
+            )
 
             if g is None:
                 print("Graph construction failed.")
@@ -481,6 +591,11 @@ def build_id_graph_widget(spark, sc):
 
             # show PageRank top-10
             pr = compute_pagerank(g).orderBy(col("rank").desc()).limit(10)
+            pr.show(truncate=False)
+            authors = compute_author_influence(g, top_n=10)
+            if authors is not None:
+                print("\nTop authors by influence:")
+                authors.show(truncate=False)
 
             # save to parquet
             v_path, e_path = save_graph_parquet(g, "id_graph", PROJECT_ROOT)
@@ -491,4 +606,4 @@ def build_id_graph_widget(spark, sc):
             print(f"Interactive graph saved & displayed from:\n  {html_path}")
 
     btn.on_click(on_click)
-    display(widgets.VBox([txt, btn, out]))
+    display(widgets.VBox([txt, hops, per_hop, raw, btn, out]))

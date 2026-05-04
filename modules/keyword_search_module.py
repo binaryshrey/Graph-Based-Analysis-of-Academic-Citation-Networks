@@ -7,10 +7,11 @@ import math
 import gzip
 import pickle
 import requests
+from datetime import datetime
 
 from pathlib import Path
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, explode, udf, lit, coalesce
+from pyspark.sql.functions import col, explode, udf, lit, coalesce, countDistinct, sum as spark_sum
 from pyspark.sql.types import (
     StructType, StructField,
     StringType, IntegerType,
@@ -31,10 +32,13 @@ def initialize_spark(
     shuffle_partitions: int = 32
 ):
     """Initialize SparkSession with GraphFrames support."""
+    ivy_dir = Path(__file__).resolve().parent.parent / ".spark_ivy"
+    ivy_dir.mkdir(parents=True, exist_ok=True)
     spark = SparkSession.builder \
         .appName(app_name) \
         .config("spark.driver.memory", driver_memory) \
         .config("spark.sql.shuffle.partitions", str(shuffle_partitions)) \
+        .config("spark.jars.ivy", str(ivy_dir)) \
         .config("spark.jars.packages", "graphframes:graphframes:0.8.4-spark3.5-s_2.13") \
         .getOrCreate()
     sc = spark.sparkContext
@@ -66,6 +70,7 @@ def define_schema():
 API_BASE = "https://api.openalex.org"
 API_KEY = "MDWHtY4UnD5CKLVBenpBt4"
 NYU_INSTITUTION = "i57206974"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _openalex_params(extra=None):
@@ -76,64 +81,130 @@ def _openalex_params(extra=None):
     return params
 
 
+def _normalize_authors(authorships):
+    authors = []
+    for auth in (authorships or []):
+        author = auth.get("author", {})
+        authors.append({
+            "authorId": (author.get("id") or "").replace("https://openalex.org/", ""),
+            "name": author.get("display_name", "")
+        })
+    return authors
+
+
+def _normalize_work(w):
+    return {
+        "paperId": w["id"].replace("https://openalex.org/", ""),
+        "title": w.get("title") or w.get("display_name", ""),
+        "year": w.get("publication_year"),
+        "authors": _normalize_authors(w.get("authorships")),
+        "referenced_works": [
+            ref.replace("https://openalex.org/", "")
+            for ref in (w.get("referenced_works") or [])
+        ],
+        "cited_by_count": w.get("cited_by_count", 0)
+    }
+
+
+def _save_raw_payload(payload, query_name, project_root: Path = PROJECT_ROOT):
+    raw_dir = Path(project_root) / "keyword_search" / "raw_json"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in query_name)[:80]
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    raw_path = raw_dir / f"{safe_name}_{timestamp}.json.gz"
+    with gzip.open(raw_path, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"Saved raw OpenAlex response to {raw_path}")
+    return raw_path
+
+
 # ─── 4. OPENALEX API HELPERS ─────────────────────────────────────────────────
 
-def keyword_search(keywords, limit=100, page=1):
+def keyword_search(
+    keywords,
+    limit=100,
+    page=1,
+    use_cursor=None,
+    save_raw_json=False,
+    project_root: Path = PROJECT_ROOT,
+):
     """Search for NYU-affiliated papers by keywords via OpenAlex."""
     if isinstance(keywords, list):
         query = " ".join(keywords)
     else:
         query = keywords
 
-    params = _openalex_params({
-        "filter": f"authorships.institutions.lineage:{NYU_INSTITUTION}",
-        "search": query,
-        "per_page": min(limit, 100),
-        "page": page,
-        "select": "id,title,publication_year,authorships,referenced_works,cited_by_count"
-    })
-
     url = f"{API_BASE}/works"
     session = requests.Session()
     try:
-        r = session.get(url, params=params)
-        r.raise_for_status()
-        data = r.json().get("results", [])
-        print(f"Found {len(data)} papers for query \u201c{query}\u201d")
-
-        # normalize to internal format
+        per_page = min(limit, 200)
+        use_cursor = limit > 100 if use_cursor is None else use_cursor
         papers = []
-        for w in data:
-            authors = []
-            for auth in (w.get("authorships") or []):
-                a = auth.get("author", {})
-                authors.append({
-                    "authorId": (a.get("id") or "").replace("https://openalex.org/", ""),
-                    "name": a.get("display_name", "")
-                })
-            papers.append({
-                "paperId": w["id"].replace("https://openalex.org/", ""),
-                "title": w.get("title") or w.get("display_name", ""),
-                "year": w.get("publication_year"),
-                "authors": authors,
-                "referenced_works": [
-                    ref.replace("https://openalex.org/", "")
-                    for ref in (w.get("referenced_works") or [])
-                ],
-                "cited_by_count": w.get("cited_by_count", 0)
+        raw_payloads = []
+        seen_ids = set()
+        cursor = "*"
+        current_page = page
+
+        while len(papers) < limit:
+            params = _openalex_params({
+                "filter": f"authorships.institutions.lineage:{NYU_INSTITUTION}",
+                "search": query,
+                "per_page": per_page,
+                "select": "id,title,publication_year,authorships,referenced_works,cited_by_count"
             })
+            if use_cursor:
+                params["cursor"] = cursor
+            else:
+                params["page"] = current_page
+
+            r = session.get(url, params=params)
+            r.raise_for_status()
+            payload = r.json()
+            data = payload.get("results", [])
+            if save_raw_json:
+                raw_payloads.append(payload)
+            if not data:
+                break
+
+            for work in data:
+                normalized = _normalize_work(work)
+                if normalized["paperId"] not in seen_ids:
+                    seen_ids.add(normalized["paperId"])
+                    papers.append(normalized)
+                if len(papers) >= limit:
+                    break
+
+            if use_cursor:
+                cursor = payload.get("meta", {}).get("next_cursor")
+                if not cursor:
+                    break
+            else:
+                if len(data) < per_page:
+                    break
+                current_page += 1
+
+        if save_raw_json and raw_payloads:
+            _save_raw_payload({
+                "query": query,
+                "limit": limit,
+                "use_cursor": use_cursor,
+                "pages": raw_payloads,
+            }, query_name=f"keyword_{query}", project_root=project_root)
+
+        print(f"Found {len(papers)} papers for query \"{query}\"")
         return papers
     except Exception as e:
         print(f"keyword_search error: {e}")
         return []
 
 
-def fetch_works_by_ids(openalex_ids):
+def fetch_works_by_ids(openalex_ids, save_raw_json=False, raw_tag="keyword_ids", project_root: Path = PROJECT_ROOT):
     """
     Fetch metadata for a list of OpenAlex work IDs using filter OR syntax.
     """
     session = requests.Session()
     results = []
+    raw_payloads = []
     batch_size = 50
 
     for i in range(0, len(openalex_ids), batch_size):
@@ -154,29 +225,21 @@ def fetch_works_by_ids(openalex_ids):
         try:
             r = session.get(f"{API_BASE}/works", params=params)
             r.raise_for_status()
-            data = r.json().get("results", [])
+            payload = r.json()
+            data = payload.get("results", [])
+            if save_raw_json:
+                raw_payloads.append(payload)
             print(f"Fetched batch {i // batch_size + 1}: {len(data)} works")
             for w in data:
-                authors = []
-                for auth in (w.get("authorships") or []):
-                    a = auth.get("author", {})
-                    authors.append({
-                        "authorId": (a.get("id") or "").replace("https://openalex.org/", ""),
-                        "name": a.get("display_name", "")
-                    })
-                results.append({
-                    "paperId": w["id"].replace("https://openalex.org/", ""),
-                    "title": w.get("title") or w.get("display_name", ""),
-                    "year": w.get("publication_year"),
-                    "authors": authors,
-                    "referenced_works": [
-                        ref.replace("https://openalex.org/", "")
-                        for ref in (w.get("referenced_works") or [])
-                    ],
-                    "cited_by_count": w.get("cited_by_count", 0)
-                })
+                results.append(_normalize_work(w))
         except Exception as e:
             print(f"fetch_works_by_ids error on batch {i // batch_size + 1}: {e}")
+
+    if save_raw_json and raw_payloads:
+        _save_raw_payload({
+            "openalex_ids": openalex_ids,
+            "batches": raw_payloads,
+        }, query_name=raw_tag, project_root=project_root)
 
     return results
 
@@ -185,7 +248,7 @@ def fetch_works_by_ids(openalex_ids):
 
 def build_graph_from_keywords(
     spark, sc, keywords,
-    limit=100, central_paper=None, min_similarity=0.0
+    limit=100, central_paper=None, min_similarity=0.0, save_raw_json=False
 ):
     """Main entry: search by keywords → build citation GraphFrame."""
     schema = define_schema()
@@ -193,7 +256,7 @@ def build_graph_from_keywords(
     # 1) search
     if isinstance(keywords, str):
         keywords = [k.strip() for k in keywords.split(",")]
-    papers = keyword_search(keywords, limit=limit)
+    papers = keyword_search(keywords, limit=limit, save_raw_json=save_raw_json, project_root=PROJECT_ROOT)
     if not papers:
         print("No papers found.")
         return None
@@ -208,7 +271,12 @@ def build_graph_from_keywords(
         # normalize central_paper ID
         central_paper = central_paper.replace("https://openalex.org/", "")
         if central_paper not in ids:
-            cent_papers = fetch_works_by_ids([central_paper])
+            cent_papers = fetch_works_by_ids(
+                [central_paper],
+                save_raw_json=save_raw_json,
+                raw_tag="keyword_central_paper",
+                project_root=PROJECT_ROOT,
+            )
             if cent_papers:
                 print("Central Paper found")
                 cent_rdd = sc.parallelize(cent_papers)
@@ -475,6 +543,36 @@ def compute_pagerank(g, reset_prob=0.15, max_iter=10):
     return ranks.join(g.vertices.select("id", "title"), on="id")
 
 
+def compute_author_influence(g, top_n=None):
+    """Aggregate paper-level PageRank into author-level influence scores."""
+    if "authors" not in g.vertices.columns:
+        print("Author information is not available in this graph.")
+        return None
+
+    pagerank_df = compute_pagerank(g).select("id", "rank")
+    author_scores = (
+        g.vertices
+        .select("id", explode("authors").alias("author"))
+        .join(pagerank_df, on="id", how="inner")
+        .select(
+            "id",
+            col("author.authorId").alias("authorId"),
+            col("author.name").alias("authorName"),
+            "rank",
+        )
+        .filter(col("authorId") != "")
+        .groupBy("authorId", "authorName")
+        .agg(
+            spark_sum("rank").alias("influenceScore"),
+            countDistinct("id").alias("paperCount"),
+        )
+        .orderBy(col("influenceScore").desc(), col("paperCount").desc())
+    )
+    if top_n:
+        return author_scores.limit(top_n)
+    return author_scores
+
+
 # ─── 8. VISUALIZATION ──────────────────────────────────────────────────────────
 
 def _rank_color(rank, min_rank, max_rank):
@@ -612,10 +710,9 @@ def generate_interactive_graph(
 
 def save_graph_parquet(g, name, project_root: Path, shuffle_partitions: int = 32):
     """Persist vertices & edges as Parquet under project_root/processed/."""
-    out_verts = project_root / "processed" / "vertices"
-    out_edges = project_root / "processed" / "edges_weighted"
+    out_verts = project_root / "processed" / f"{name}_vertices"
+    out_edges = project_root / "processed" / f"{name}_edges_weighted"
     g.vertices \
-     .select("id", "title", "year") \
      .write \
      .mode("overwrite") \
      .partitionBy("year") \
@@ -634,7 +731,7 @@ def save_graph_parquet(g, name, project_root: Path, shuffle_partitions: int = 32
 def search_papers_widget():
     """Display widget to search keywords (calls keyword_search)."""
     kw = widgets.Text(description="Keywords:")
-    lim = widgets.IntSlider(description="Max Papers:", min=10, max=100, step=10, value=50)
+    lim = widgets.IntSlider(description="Max Papers:", min=10, max=1000, step=10, value=100)
     btn = widgets.Button(description="Search", button_style="primary")
     out = widgets.Output()
 
@@ -654,8 +751,9 @@ def search_papers_widget():
 def build_graph_widget(spark, sc):
     """Display widget to build & visualize a keyword-based citation graph."""
     kw = widgets.Text(description="Keywords:")
-    lim = widgets.IntSlider(description="Max Papers:", min=10, max=100, step=10, value=50)
+    lim = widgets.IntSlider(description="Max Papers:", min=10, max=1000, step=10, value=100)
     cent = widgets.Text(description="Base Paper:")
+    raw = widgets.Checkbox(description="Save raw JSON", value=True)
     btn = widgets.Button(description="Build Graph", button_style="primary")
     out = widgets.Output()
 
@@ -664,10 +762,16 @@ def build_graph_widget(spark, sc):
             out.clear_output()
             terms = [t.strip() for t in kw.value.split(",")]
             g = build_graph_from_keywords(spark, sc, terms, limit=lim.value,
-                                          central_paper=cent.value or None)
+                                          central_paper=cent.value or None,
+                                          save_raw_json=raw.value)
             if g:
                 pr = compute_pagerank(g).orderBy(col("rank").desc()).limit(10)
                 pr.show(truncate=False)
+                authors = compute_author_influence(g, top_n=10)
+                if authors is not None:
+                    print("\nTop authors by influence:")
+                    authors.show(truncate=False)
+                save_graph_parquet(g, "kw_graph", PROJECT_ROOT)
                 generate_interactive_graph(g, "kw_graph.html", PROJECT_ROOT)
     btn.on_click(on_click)
-    display(widgets.VBox([kw, lim, cent, btn, out]))
+    display(widgets.VBox([kw, lim, cent, raw, btn, out]))
