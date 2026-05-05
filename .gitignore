@@ -30,3 +30,8 @@ Thumbs.db
 
 # Environment variables
 .env
+
+# Data outputs
+keyword_search/output/
+publication_search/output/
+paper_id_search/output/
