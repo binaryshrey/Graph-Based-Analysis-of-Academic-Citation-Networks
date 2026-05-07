@@ -114,6 +114,57 @@ Node size in visualizations is proportional to PageRank score.
 9. PyVis renders an interactive HTML visualization (nodes colored by community, sized by PageRank)
 10. User explores the graph in their browser
 
+### Workflow Flowchart
+
+```mermaid
+flowchart TD
+    A[User Opens Jupyter Notebook] --> B[Choose Workflow]
+    B --> C1[Keyword Search]
+    B --> C2[Paper ID Search]
+    B --> C3[Publication and Year Search]
+
+    C1 --> D[Call OpenAlex API]
+    C2 --> D
+    C3 --> D
+
+    D --> E[Fetch Raw Scholarly Metadata]
+    E --> F[Save Raw JSON Responses]
+    F --> G[Normalize Records]
+
+    G --> G1[Clean Null Values]
+    G1 --> G2[Deduplicate Papers]
+    G2 --> G3[Deduplicate References]
+    G3 --> H[Load Data into Spark DataFrames]
+
+    H --> I[Build Vertices DataFrame]
+    H --> J[Build Edges DataFrame]
+
+    C2 --> K[Multi Hop Expansion]
+    K --> D
+
+    I --> L[Construct GraphFrame]
+    J --> L
+
+    L --> M[Run PageRank]
+    L --> N[Run Louvain Community Detection]
+    M --> O[Compute Author Influence]
+    N --> P[Assign Community Labels]
+
+    O --> Q[Save Processed Graph as Parquet]
+    P --> Q
+
+    Q --> R[Generate Interactive PyVis Graph]
+    R --> S[Display HTML Graph in Notebook]
+
+    M --> T[Node Size by Influence]
+    P --> U[Node Color by Community]
+    J --> V[Directed Citation Edges]
+
+    T --> S
+    U --> S
+    V --> S
+```
+
 ---
 
 ## Repository Structure
