@@ -169,9 +169,7 @@ flowchart TD
 
 #### Project Walkthrough Video
 
-<video src="./docs/media/project-demo.mov" controls width="100%"></video>
-
-If the embedded player does not render on your GitHub client, use the direct file link: [Project Demo Video](./docs/media/project-demo.mov)
+![Project Demo GIF](./docs/media/project-demo.gif)
 
 #### Screenshots
 
