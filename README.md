@@ -167,9 +167,9 @@ flowchart TD
 
 ### Demo Media
 
-#### Project Walkthrough Video
+#### Paper ID Search Output
 
-![Project Demo GIF](./docs/media/project-demo.gif)
+![Paper ID Search Output GIF](./docs/media/paper-id-search-output.gif)
 
 #### Screenshots
 
