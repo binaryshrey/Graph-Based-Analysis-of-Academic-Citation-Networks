@@ -165,6 +165,24 @@ flowchart TD
     V --> S
 ```
 
+### Demo Media
+
+#### Project Walkthrough Video
+
+<video src="./docs/media/project-demo.mov" controls width="100%"></video>
+
+If the embedded player does not render on your GitHub client, use the direct file link: [Project Demo Video](./docs/media/project-demo.mov)
+
+#### Screenshots
+
+**Keyword / Topic Graph View**
+
+![Keyword Graph Screenshot](./docs/media/keyword-graph-screenshot.png)
+
+**Publication / Venue Graph View**
+
+![Publication Graph Screenshot](./docs/media/publication-graph-screenshot.png)
+
 ---
 
 ## Repository Structure
