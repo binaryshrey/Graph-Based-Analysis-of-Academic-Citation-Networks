@@ -58,33 +58,6 @@ Data is retrieved programmatically using the OpenAlex REST API with:
 
 ---
 
-## Graph Analytics
-
-### Citation Network Model
-
-- **Nodes** = research papers (with metadata: title, year, venue, authors)
-- **Edges** = directed citation links (paper A references paper B), weight = 1.0
-
-### Louvain Community Detection
-
-The primary analytics method. The Louvain algorithm optimizes modularity to partition the citation graph into communities of densely interconnected papers. These communities represent:
-- Underlying research topics
-- Thematic groupings
-- Knowledge communities within NYU-affiliated publications
-
-**Implementation**: Uses `networkx` + `python-louvain` (`community.community_louvain.best_partition`) with configurable resolution parameter. Falls back to GraphFrames `labelPropagation` if dependencies are unavailable.
-
-**Output**: Each paper is assigned a community ID. The visualization colors nodes by community, making cluster structure immediately visible.
-
-### Weighted PageRank
-
-A custom Spark DataFrame-based PageRank implementation identifies the most influential papers based on citation connectivity. Configurable parameters:
-- Reset probability (default: 0.15)
-- Max iterations (default: 10)
-
-Node size in visualizations is proportional to PageRank score.
-
----
 
 ## Architecture
 
@@ -100,19 +73,6 @@ Node size in visualizations is proportional to PageRank score.
 | Analytics     | Centrality             | Weighted PageRank (custom Spark impl)   |
 | Orchestration | Notebook               | Jupyter (`driver.ipynb`)                |
 | Visualization | Graph Renderer         | PyVis 0.3.1 (interactive HTML)          |
-
-### Data Flow
-
-1. User submits a query (keyword / paper ID / publication+year) via Jupyter widget
-2. The relevant module calls the OpenAlex API with NYU institution filter
-3. Raw JSON responses are parsed, normalized, and deduplicated
-4. Spark reads the data into DataFrames
-5. Two DataFrames are built: **vertices** (papers) and **edges** (citations)
-6. GraphFrames constructs the directed citation graph
-7. Louvain community detection partitions nodes into research clusters
-8. PageRank scores identify influential papers
-9. PyVis renders an interactive HTML visualization (nodes colored by community, sized by PageRank)
-10. User explores the graph in their browser
 
 ### Workflow Flowchart
 
@@ -164,6 +124,60 @@ flowchart TD
     U --> S
     V --> S
 ```
+### Data Flow
+
+1. User submits a query (keyword / paper ID / publication+year) via Jupyter widget
+2. The relevant module calls the OpenAlex API with NYU institution filter
+3. Raw JSON responses are parsed, normalized, and deduplicated
+4. Spark reads the data into DataFrames
+5. Two DataFrames are built: **vertices** (papers) and **edges** (citations)
+6. GraphFrames constructs the directed citation graph
+7. Louvain community detection partitions nodes into research clusters
+8. PageRank scores identify influential papers
+9. PyVis renders an interactive HTML visualization (nodes colored by community, sized by PageRank)
+10. User explores the graph in their browser
+
+### Demo Media
+
+#### Paper ID Search Graph View
+
+![Paper ID Search Output GIF](./docs/media/paper-id-search-output.gif)
+
+#### Keyword / Topic-based Graph View
+
+![Keyword Graph Screenshot](./docs/media/keyword-graph-screenshot.png)
+
+#### Publication / Venue Graph View
+
+![Publication Graph Screenshot](./docs/media/publication-graph-screenshot.png)
+
+---
+
+## Graph Analytics
+
+### Citation Network Model
+
+- **Nodes** = research papers (with metadata: title, year, venue, authors)
+- **Edges** = directed citation links (paper A references paper B), weight = 1.0
+
+### Louvain Community Detection
+
+The primary analytics method. The Louvain algorithm optimizes modularity to partition the citation graph into communities of densely interconnected papers. These communities represent:
+- Underlying research topics
+- Thematic groupings
+- Knowledge communities within NYU-affiliated publications
+
+**Implementation**: Uses `networkx` + `python-louvain` (`community.community_louvain.best_partition`) with configurable resolution parameter. Falls back to GraphFrames `labelPropagation` if dependencies are unavailable.
+
+**Output**: Each paper is assigned a community ID. The visualization colors nodes by community, making cluster structure immediately visible.
+
+### Weighted PageRank
+
+A custom Spark DataFrame-based PageRank implementation identifies the most influential papers based on citation connectivity. Configurable parameters:
+- Reset probability (default: 0.15)
+- Max iterations (default: 10)
+
+Node size in visualizations is proportional to PageRank score.
 
 ---
 
